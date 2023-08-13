@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	pb "go.etcd.io/etcd/raft/raftpb"
+	pb "github.com/coreos/etcd/raft/raftpb"
 )
 
 type MemoryStorage struct {

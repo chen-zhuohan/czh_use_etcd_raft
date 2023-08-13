@@ -2,14 +2,14 @@ package raft_etcd_benchmark
 
 import (
 	"context"
-	"fmt"
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"time"
 	_ "unsafe"
 
+	pb "github.com/coreos/etcd/raft/raftpb"
 	"go.etcd.io/etcd/raft"
-	pb "go.etcd.io/etcd/raft/raftpb"
 )
 
 type Process struct {
@@ -19,18 +19,18 @@ type Process struct {
 	node        raft.Node
 	storage     *MemoryStorage
 	application *Application
+	wait        Wait
 	msgCount    uint64
 }
 
 func New(peers ...uint64) *Process {
 	c := &raft.Config{
-		ID:                        peers[0],
-		ElectionTick:              10,
-		HeartbeatTick:             1,
-		Storage:                   NewMemoryStorage(),
-		MaxSizePerMsg:             1024 * 1024,
-		MaxInflightMsgs:           256,
-		MaxUncommittedEntriesSize: 1 << 30,
+		ID:              peers[0],
+		ElectionTick:    10,
+		HeartbeatTick:   1,
+		Storage:         NewMemoryStorage(),
+		MaxSizePerMsg:   1024 * 1024,
+		MaxInflightMsgs: 256,
 	}
 
 	rpeers := make([]raft.Peer, len(peers))
@@ -45,11 +45,23 @@ func New(peers ...uint64) *Process {
 		node:        node,
 		storage:     c.Storage.(*MemoryStorage),
 		application: NewApplication(),
+		wait:        NewWait(),
 	}
 }
 
 func (p *Process) Propose(ctx context.Context, data []byte) error {
 	return p.node.Propose(ctx, data)
+}
+
+func (p *Process) ProposeWait(ctx context.Context, data []byte) error {
+	id, _ := binary.Uvarint(data[1:])
+	ch := p.wait.Register(id)
+	err := p.node.Propose(ctx, data)
+	if err != nil {
+		return err
+	}
+	<-ch
+	return nil
 }
 
 func (p *Process) RecvRaftRPC(ctx context.Context, m pb.Message) error {
@@ -66,6 +78,7 @@ func (p *Process) Run(ctx context.Context) {
 			case <-ticker.C:
 				p.node.Tick()
 			case rd := <-p.node.Ready():
+				// 1. 处理快照、HardState、Entries
 				if !raft.IsEmptySnap(rd.Snapshot) {
 					panic("not handle snapshot")
 				}
@@ -74,7 +87,7 @@ func (p *Process) Run(ctx context.Context) {
 				}
 				p.storage.Append(rd.Entries)
 
-				f := StartMSTimer()
+				// 2. 发送Message
 				wg := sync.WaitGroup{}
 				wg.Add(len(rd.Messages))
 				for _, msg := range rd.Messages {
@@ -91,6 +104,8 @@ func (p *Process) Run(ctx context.Context) {
 						}
 					}(msg)
 				}
+
+				// 3. 应用 CommittedEntries
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -101,26 +116,30 @@ func (p *Process) Run(ctx context.Context) {
 							p.node.ApplyConfChange(cc)
 						} else if e.Type == pb.EntryNormal {
 							p.application.ApplyEntries(ctx, e)
+							if len(e.Data) > 1 {
+								id, _ := binary.Uvarint(e.Data[1:])
+								p.wait.Trigger(id, id)
+							}
 						} else {
 							panic("unknown type: " + e.Type.String())
 						}
 					}
 				}()
 				wg.Wait()
+				// 4. 调用Advance
 				p.node.Advance()
 
-				if len(rd.Messages) > 0 {
-					fmt.Println(f(), "\t", len(rd.CommittedEntries), "\t", len(rd.Messages[0].Entries))
-				} else {
-					fmt.Println(f(), "\t", len(rd.CommittedEntries))
-				}
+				//if len(rd.Messages) > 0 {
+				//	fmt.Println(f(), "\t", len(rd.CommittedEntries), "\t", len(rd.Messages[0].Entries))
+				//} else {
+				//	fmt.Println(f(), "\t", len(rd.CommittedEntries))
+				//}
 			}
 		}
 	}()
 }
 
 func (p *Process) IsLeader() bool {
-	//fmt.Println(p.node.Status().RaftState, p.node.Status().Lead, p.node.Status().Term, p.node.Status().Vote)
 	return p.node.Status().RaftState == raft.StateLeader
 }
 

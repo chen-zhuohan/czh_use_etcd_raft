@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	pb "go.etcd.io/etcd/raft/raftpb"
+	pb "github.com/coreos/etcd/raft/raftpb"
 )
 
 var net *Net = &Net{
